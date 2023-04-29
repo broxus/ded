@@ -8,6 +8,8 @@ edition = "2021"
 rust-version = "1.65"
 include = ["src/**/*.rs", "LICENSE-*", "README.md"]
 license = "MIT OR Apache-2.0"
+keywords = ["cache", "caching", "coalescing", "coalesce"]
+categories = ["asynchronous", "caching", "web-programming"]
 
 [dependencies]
 parking_lot = "0.12.1"
