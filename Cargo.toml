@@ -1,14 +1,19 @@
 [package]
 name = "ded"
+description = "Dead Easy Deduplication."
+authors = ["<crates@0xdeafbeef.dev>", "<i.kalinin@dexpa.io>"]
+repository = "https://github.com/broxus/ded"
 version = "0.1.0"
 edition = "2021"
+rust-version = "1.65"
+include = ["src/**/*.rs", "LICENSE-*", "README.md"]
+license = "MIT OR Apache-2.0"
 
 [dependencies]
 parking_lot = "0.12.1"
 schnellru = "0.2.1"
 thiserror = "1.0.40"
 tokio = { version = "1.28.0", features = ["sync"] }
-tracing = "0.1"
 
 [dev-dependencies]
 tokio = { version = "1.28.0", features = ["full"] }

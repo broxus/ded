@@ -18,6 +18,11 @@
 
 Dead Easy Deduplication
 
+## About
+
+`ded` is a library which performs request coalescing and caching backed
+by [schnellru](https://github.com/koute/schnellru).
+
 ## Usage
 
 ```toml
@@ -41,7 +46,7 @@ assert_eq!(value, "value"); // value is returned, request is performed
 // Accessing a cached value
 {
     let start = std::time::Instant::now();
-    
+
     let value = cache.get_or_update(key, value_fut).await?;
     assert_eq!(value, "value");
 
@@ -50,7 +55,15 @@ assert_eq!(value, "value"); // value is returned, request is performed
 }
 ```
 
-### Description
+## Contributing
 
-DED is a lib which performs request coalescing and caching backed
-by [schnellru](https://github.com/koute/schnellru)
+We welcome contributions to the project! If you notice any issues or errors, feel free to open an issue or submit a pull request.
+
+## License
+
+Licensed under either of
+
+* Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE) or <http://www.apache.org/licenses/LICENSE-2.0>)
+* MIT license ([LICENSE-MIT](LICENSE-MIT) or <http://opensource.org/licenses/MIT>)
+
+at your option.
