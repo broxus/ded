@@ -45,12 +45,13 @@ use schnellru::{ByLength, LruMap};
 use tokio::sync::watch;
 
 /// Deduplication cache for requests.
-pub struct DedCache<Req, Res, Err> {
-    cache: RequestLru<Req, Res, Err>,
-    lifetime: Duration,
-    requests_made: AtomicU64,
-    calls_made: AtomicU64,
-    cache_hit: AtomicU64,
+pub struct DedCache<Req, Res, Err>(Arc<SharedState<Req, Res, Err>>);
+
+impl<Req, Res, Err> Clone for DedCache<Req, Res, Err> {
+    #[inline]
+    fn clone(&self) -> Self {
+        Self(self.0.clone())
+    }
 }
 
 impl<Req, Res, Err> DedCache<Req, Res, Err>
@@ -63,13 +64,7 @@ where
     /// * `lifetime` - The lifetime of a cached value.
     /// * `size` - The maximum number of cached values.
     pub fn new(lifetime: Duration, size: u32) -> Self {
-        DedCache {
-            cache: Mutex::new(LruMap::new(ByLength::new(size))),
-            lifetime,
-            requests_made: Default::default(),
-            cache_hit: Default::default(),
-            calls_made: Default::default(),
-        }
+        Self(Arc::new(SharedState::new(lifetime, size)))
     }
 
     /// Calling this method can cause 3 different things to happen:
@@ -83,6 +78,44 @@ where
     /// * `key` - The key to lookup in the cache.
     /// * `f` - The future to call if the key is not in the cache or the value is older than `lifetime`.
     pub async fn get_or_update<F, Fut>(&self, key: Req, f: F) -> Result<Res, CoalesceError<Err>>
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = Result<Res, Err>>,
+    {
+        self.0.get_or_update(key, f).await
+    }
+
+    /// Returns cache performance statistics.
+    pub fn fetch_stats(&self) -> Stats {
+        self.0.fetch_stats()
+    }
+}
+
+struct SharedState<Req, Res, Err> {
+    cache: RequestLru<Req, Res, Err>,
+    lifetime: Duration,
+    requests_made: AtomicU64,
+    calls_made: AtomicU64,
+    cache_hit: AtomicU64,
+}
+
+impl<Req, Res, Err> SharedState<Req, Res, Err>
+where
+    Req: Hash + Eq + Clone + Debug,
+    Res: Clone,
+    Err: Clone,
+{
+    fn new(lifetime: Duration, size: u32) -> Self {
+        Self {
+            cache: Mutex::new(LruMap::new(ByLength::new(size))),
+            lifetime,
+            requests_made: Default::default(),
+            cache_hit: Default::default(),
+            calls_made: Default::default(),
+        }
+    }
+
+    async fn get_or_update<F, Fut>(&self, key: Req, f: F) -> Result<Res, CoalesceError<Err>>
     where
         F: FnOnce() -> Fut,
         Fut: Future<Output = Result<Res, Err>>,
@@ -199,8 +232,7 @@ where
         }
     }
 
-    /// Returns cache performance statistics.
-    pub fn fetch_stats(&self) -> Stats {
+    fn fetch_stats(&self) -> Stats {
         let (memory_usage, len) = {
             let cache = self.cache.lock();
             (cache.memory_usage(), cache.len())
@@ -306,7 +338,7 @@ mod test {
         // at this point the value is expired
 
         {
-            let mut cache = cache.cache.lock();
+            let mut cache = cache.0.cache.lock();
             let val = cache.get(&key).unwrap();
             let val = val.borrow();
             let val = val.as_ref().unwrap();
@@ -381,7 +413,7 @@ mod test {
         // waiting for the first update to finish
         println!("Val1 = {:?}", value1_second_get.await.unwrap().unwrap());
 
-        let lock = cache.cache.lock();
+        let lock = cache.0.cache.lock();
         for (i, entry) in lock.iter() {
             let entry = entry.borrow();
             println!("{i}: {:?}", entry.is_some());
