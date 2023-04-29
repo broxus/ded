@@ -193,18 +193,18 @@ where
                 let result = f().await;
                 self.update_calls_number();
 
-                // Force replace the data in cache (even if no watch was created)
                 if result.is_ok() {
                     // Prevent watch from being removed from the cache
                     drop_guard.disarm();
-
-                    tx.send_modify(|value| {
-                        *value = Some(Entry {
-                            data: result.clone(),
-                            since: Instant::now(),
-                        })
-                    });
                 }
+
+                // Notify all waiters with result
+                tx.send_modify(|value| {
+                    *value = Some(Entry {
+                        data: result.clone(),
+                        since: Instant::now(),
+                    })
+                });
 
                 // Done
                 result.map_err(CoalesceError::Direct)
