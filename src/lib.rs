@@ -29,91 +29,31 @@
     clippy::str_to_string,
     rust_2018_idioms,
     future_incompatible,
-    nonstandard_style,
-    missing_debug_implementations
+    nonstandard_style
 )]
 #![deny(unreachable_pub, private_in_public)]
-#![allow(elided_lifetimes_in_paths, clippy::type_complexity)]
 
 use std::fmt::Debug;
 use std::future::Future;
 use std::hash::Hash;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
-use schnellru::{ByLength, Limiter, LruMap};
-use tokio::sync::Notify;
+use schnellru::{Limiter, LruMap};
+use tokio::sync::watch;
 
-/// Shared cache using LRU eviction policy.
-#[allow(missing_debug_implementations)]
-#[derive(Clone)]
-pub struct LCache<K, V, L = ByLength>
-where
-    L: Limiter<K, V>,
-{
-    cache: Arc<Mutex<LruMap<K, V, L>>>,
-}
-
-impl<K, V> LCache<K, V>
-where
-    K: Hash + Eq,
-    V: Clone,
-{
-    pub fn new(size: usize) -> Self {
-        LCache {
-            cache: Arc::new(Mutex::new(LruMap::new(ByLength::new(size as u32)))),
-        }
-    }
-}
-
-impl<K, V, L> LCache<K, V, L>
-where
-    K: Hash + Eq,
-    V: Clone,
-    L: Limiter<K, V>,
-{
-    /// Returns a copy of the value for a given key and promotes that element to be the most recently used.
-    pub fn get(&self, key: &K) -> Option<V> {
-        self.cache.lock().get(key).cloned()
-    }
-
-    /// Inserts a new element into the map.
-    /// Can fail if the element is rejected by the limiter or if we fail to grow an empty map.
-    /// Returns true if the element was inserted; false otherwise.
-    pub fn insert<'a>(&self, key: L::KeyToInsert<'a>, value: V) -> bool
-    where
-        L::KeyToInsert<'a>: Hash + PartialEq<K>,
-    {
-        self.cache.lock().insert(key, value)
-    }
-
-    pub fn stats(&self) -> LruStats {
-        let lock = self.cache.lock();
-
-        let memory_usage = lock.memory_usage();
-        let len = lock.len();
-
-        LruStats { len, memory_usage }
-    }
-}
-
-#[derive(Clone, Debug)]
-pub struct LruStats {
-    pub len: usize,
-    pub memory_usage: usize,
-}
-
-#[allow(missing_debug_implementations)]
-pub struct Cache<Req, Res, Err> {
-    cache: LCache<Req, Entry<Res, Err>, ByLength>,
+/// Deduplication cache for requests.
+pub struct DedCache<Req, Res, Err> {
+    cache: RequestLru<Req, Res, Err>,
     lifetime: Duration,
     requests_made: AtomicU64,
+    calls_made: AtomicU64,
     cache_hit: AtomicU64,
 }
 
-impl<Req, Res, Err> Cache<Req, Res, Err>
+impl<Req, Res, Err> DedCache<Req, Res, Err>
 where
     Req: Hash + Eq + Clone + Debug,
     Res: Clone,
@@ -122,12 +62,13 @@ where
     /// # Arguments
     /// * `lifetime` - The lifetime of a cached value.
     /// * `size` - The maximum number of cached values.
-    pub fn new(lifetime: Duration, size: usize) -> Self {
-        Cache {
-            cache: LCache::new(size),
+    pub fn new(lifetime: Duration, size: u32) -> Self {
+        DedCache {
+            cache: RequestLru::new(size),
             lifetime,
             requests_made: Default::default(),
             cache_hit: Default::default(),
+            calls_made: Default::default(),
         }
     }
 
@@ -148,8 +89,10 @@ where
     {
         self.update_request_number();
 
-        if let Some(entry) = self.get(&key) {
-            match entry {
+        {
+            let mut cache = self.cache.lock();
+
+            match cache.get(&key) {
                 Entry::Data {
                     response,
                     last_update,
@@ -161,11 +104,30 @@ where
                     }
                 }
                 Entry::UpdateInProgress(notify) => {
+                    let mut notify = notify.subscribe();
+                    {
+                        let result = notify.borrow();
+                        if let Some(result) = &*result {
+                            return result.clone().map_err(CoalesceError::Indirect);
+                        }
+                    }
+
                     // Waiting for an existing response
-                    return notify.wait().await.map_err(CoalesceError::Indirect);
+                    if notify.changed().await.is_ok() {
+                        let result = notify.borrow().clone().unwrap();
+                        self.update_cache_hit();
+                        return result.map_err(CoalesceError::Indirect);
+                    }
                 }
             }
+
+            let (tx, _) = watch::channel(None);
+            let tx = Arc::new(tx);
+            cache.insert(key.clone(), Entry::UpdateInProgress(tx.clone()));
+            tx
         }
+
+        if let Some(entry) = self.get(&key) {}
 
         // Initiate request otherwise
         self.update_data(key, f).await
@@ -175,10 +137,9 @@ where
     pub fn fetch_stats(&self) -> Stats {
         let requests_made = self.requests_made.load(Ordering::Relaxed);
         let cache_hit = self.cache_hit.load(Ordering::Relaxed);
-        let (memory_usage, len) = {
-            let lock = self.cache.cache.lock();
-            (lock.memory_usage(), lock.len())
-        };
+        let calls_made = self.calls_made.load(Ordering::Relaxed);
+
+        let LruStats { memory_usage, len } = self.cache.stats();
         let cache_hit_ratio = if requests_made == 0 {
             0.0
         } else {
@@ -191,6 +152,7 @@ where
             memory_usage,
             len,
             cache_hit_ratio,
+            calls_made,
         }
     }
 
@@ -199,20 +161,69 @@ where
         F: FnOnce() -> Fut,
         Fut: Future<Output = Result<Res, Err>>,
     {
-        let notify = self.insert_notify(key.clone());
+        struct RemoveWatchOnDrop<'a, Req, Res, Err>
+        where
+            Req: Hash + Eq,
+            Entry<Res, Err>: Clone,
+        {
+            key: Option<&'a Req>,
+            cache: &'a RequestLru<Req, Res, Err>,
+        }
 
-        match f().await {
-            Ok(response) => {
-                self.insert_response(key, response.clone());
-                notify.notify_ok(response.clone());
-
-                Ok(response)
-            }
-            Err(e) => {
-                notify.notify_err(e.clone());
-                Err(CoalesceError::Direct(e))
+        impl<Req, Res, Err> RemoveWatchOnDrop<'_, Req, Res, Err>
+        where
+            Req: Hash + Eq,
+            Entry<Res, Err>: Clone,
+        {
+            fn disarm(mut self) {
+                self.key = None;
             }
         }
+
+        impl<Req, Res, Err> Drop for RemoveWatchOnDrop<'_, Req, Res, Err>
+        where
+            Req: Hash + Eq,
+            Entry<Res, Err>: Clone,
+        {
+            fn drop(&mut self) {
+                if let Some(key) = self.key.take() {
+                    self.cache.remove(key);
+                }
+            }
+        }
+
+        // Create notifier if it is a new request
+        let watch = self.insert_watch(&key);
+
+        // Remove watch from the cache if the guard was not disarmed
+        let drop_guard = RemoveWatchOnDrop {
+            key: watch.is_some().then_some(&key),
+            cache: &self.cache,
+        };
+
+        // Execute request
+        let result = f().await;
+        self.update_calls_number();
+
+        // Force replace the data in cache (even if no watch was created)
+        if let Ok(response) = &result {
+            // Prevent watch from being removed from the cache
+            drop_guard.disarm();
+
+            self.insert_response(key, response.clone());
+        }
+
+        // Update watch if some
+        if let Some(watch) = watch {
+            watch.send_modify(|value| *value = Some(result.clone()));
+        }
+
+        // Done
+        result.map_err(CoalesceError::Direct)
+    }
+
+    fn update_calls_number(&self) {
+        self.calls_made.fetch_add(1, Ordering::Relaxed);
     }
 
     fn update_request_number(&self) {
@@ -223,26 +234,22 @@ where
         self.cache_hit.fetch_add(1, Ordering::Relaxed);
     }
 
-    fn get(&self, stat: &Req) -> Option<Entry<Res, Err>> {
-        self.cache.get(stat)
-    }
-
     fn insert_response(&self, key: Req, value: Res) {
         self.cache.insert(
             key,
             Entry::Data {
                 response: value,
-                last_update: std::time::Instant::now(),
+                last_update: Instant::now(),
             },
         );
     }
 
-    fn insert_notify(&self, key: Req) -> UpdateNotify<Res, Err> {
-        let notify = Arc::new(UpdateNotify::new());
+    fn insert_watch(&self, key: &Req) -> Option<Arc<RequestTx<Res, Err>>> {
+        let (tx, _) = watch::channel(None);
+        let tx = Arc::new(tx);
         self.cache
-            .insert(key, Entry::UpdateInProgress(notify.clone()));
-
-        notify
+            .insert(key.clone(), Entry::UpdateInProgress(tx.clone()))
+            .then_some(tx)
     }
 }
 
@@ -266,72 +273,6 @@ impl<E> CoalesceError<E> {
     }
 }
 
-impl<E> From<CoalesceError<E>> for E {
-    #[inline]
-    fn from(value: CoalesceError<E>) -> Self {
-        value.into_inner()
-    }
-}
-
-#[derive(Clone, Debug)]
-enum Entry<Response, Error> {
-    UpdateInProgress(Arc<UpdateNotify<Response, Error>>),
-    Data {
-        response: Response,
-        last_update: std::time::Instant,
-    },
-}
-
-#[derive(Clone, Debug)]
-struct UpdateNotify<T, E> {
-    notify: Notify,
-    data: Mutex<Option<Result<T, E>>>,
-    has_data: AtomicBool,
-}
-
-impl<T, E> UpdateNotify<T, E>
-where
-    T: Clone,
-    E: Clone,
-{
-    fn new() -> Self {
-        UpdateNotify {
-            notify: Notify::new(),
-            data: Mutex::new(None),
-            has_data: Default::default(),
-        }
-    }
-
-    fn notify_err(&self, error: E) {
-        {
-            let mut data = self.data.lock();
-            *data = NotifyData::Err(error)
-        }
-        self.has_data.store(true, Ordering::Release);
-        self.notify.notify_waiters();
-    }
-
-    fn notify_ok(&self, value: T) {
-        {
-            let mut data = self.data.lock();
-            *data = NotifyData::Ok(value);
-        }
-        self.has_data.store(true, Ordering::Release);
-        self.notify.notify_waiters();
-    }
-
-    async fn wait(&self) -> Result<T, E> {
-        if self.has_data.load(Ordering::Acquire) {
-            return self.data.lock().as_result();
-        }
-
-        self.notify.notified().await;
-        let data = self.data.lock();
-
-        data.as_result()
-    }
-}
-
 #[derive(Clone, Debug)]
 pub struct Stats {
     pub requests_made: u64,
@@ -339,6 +280,118 @@ pub struct Stats {
     pub memory_usage: usize,
     pub len: usize,
     pub cache_hit_ratio: f64,
+    pub calls_made: u64,
+}
+
+#[derive(Clone, Debug)]
+enum Entry<T, E> {
+    UpdateInProgress(Arc<RequestTx<T, E>>),
+    Data { response: T, last_update: Instant },
+}
+
+type RequestTx<T, E> = watch::Sender<Option<Result<T, E>>>;
+
+type RequestLru<K, V, E> = Mutex<LruMap<K, Entry<V, E>, ByLengthOfData>>;
+
+impl<K, V, E> RequestLru<K, V, E>
+where
+    K: Hash + Eq,
+    Entry<V, E>: Clone,
+{
+    fn new(size: u32) -> Self {
+        RequestLru {
+            cache: Mutex::new(LruMap::new(ByLengthOfData::new(size))),
+        }
+    }
+
+    fn get(&self, key: &K) -> Option<Entry<V, E>> {
+        self.cache.lock().get(key).cloned()
+    }
+
+    fn insert(&self, key: K, value: Entry<V, E>) -> bool {
+        self.cache.lock().insert(key, value)
+    }
+
+    fn remove(&self, key: &K) -> bool {
+        self.cache.lock().remove(key).is_some()
+    }
+
+    fn stats(&self) -> LruStats {
+        let lock = self.cache.lock();
+
+        let memory_usage = lock.memory_usage();
+        let len = lock.len();
+
+        LruStats { len, memory_usage }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct LruStats {
+    len: usize,
+    memory_usage: usize,
+}
+
+#[derive(Copy, Clone, Debug)]
+#[repr(transparent)]
+struct ByLengthOfData {
+    max_length: u32,
+}
+
+impl ByLengthOfData {
+    const fn new(max_length: u32) -> Self {
+        ByLengthOfData { max_length }
+    }
+}
+
+impl<K, T, E> Limiter<K, Entry<T, E>> for ByLengthOfData {
+    type KeyToInsert<'a> = K;
+    type LinkType = u32;
+
+    #[inline]
+    fn is_over_the_limit(&self, length: usize) -> bool {
+        length > self.max_length as usize
+    }
+
+    #[inline]
+    fn on_insert(
+        &mut self,
+        _length: usize,
+        key: Self::KeyToInsert<'_>,
+        value: Entry<T, E>,
+    ) -> Option<(K, Entry<T, E>)> {
+        if self.max_length > 0 {
+            Some((key, value))
+        } else {
+            None
+        }
+    }
+
+    #[inline]
+    fn on_replace(
+        &mut self,
+        _length: usize,
+        _old_key: &mut K,
+        _new_key: K,
+        old_value: &mut Entry<T, E>,
+        new_value: &mut Entry<T, E>,
+    ) -> bool {
+        !matches!(
+            (old_value, new_value),
+            (Entry::UpdateInProgress(_), Entry::UpdateInProgress(_))
+        )
+    }
+
+    #[inline]
+    fn on_removed(&mut self, _key: &mut K, _value: &mut Entry<T, E>) {}
+
+    #[inline]
+    fn on_cleared(&mut self) {}
+
+    #[inline]
+    fn on_grow(&mut self, _new_memory_usage: usize) -> bool {
+        true
+    }
 }
 
 #[cfg(test)]
@@ -350,17 +403,17 @@ mod test {
 
     #[tokio::test]
     async fn test_cache() {
-        let cache: Cache<_, _, Infallible> = Cache::new(Duration::from_secs(1), 1024);
+        let cache: DedCache<_, _, Infallible> = DedCache::new(Duration::from_secs(1), 1024);
 
         let key = "key";
 
         // inserting a value
-        let value = cache.get_or_update(key, fut()).await.unwrap();
+        let value = cache.get_or_update(key, fut).await.unwrap();
         assert_eq!(value, "value"); // value is returned
 
         let start = std::time::Instant::now();
 
-        let value = cache.get_or_update(key, fut()).await.unwrap();
+        let value = cache.get_or_update(key, fut).await.unwrap();
         // value is returned immediately
         assert_eq!(value, "value");
         assert!(start.elapsed() < Duration::from_secs(1));
@@ -375,7 +428,7 @@ mod test {
             matches!(val, Entry::Data { last_update, .. } if last_update.elapsed() > Duration::from_secs(1))
         );
 
-        let value = cache.get_or_update(key, fut()).await.unwrap();
+        let value = cache.get_or_update(key, fut).await.unwrap();
         assert_eq!(value, "value");
         // update took more than 1 second cause it was expired
         assert!(start.elapsed() > Duration::from_secs(1));
@@ -388,8 +441,8 @@ mod test {
 
     #[tokio::test]
     async fn test_with_eviction() {
-        let cache: Arc<Cache<i32, u32, Infallible>> =
-            Arc::new(Cache::new(Duration::from_secs(1), 2));
+        let cache: Arc<DedCache<i32, u32, Infallible>> =
+            Arc::new(DedCache::new(Duration::from_secs(1), 2));
 
         // creating 3 updates so that the first one is evicted
         let key1 = 1;
@@ -400,7 +453,7 @@ mod test {
             let cache = cache.clone();
             tokio::spawn(async move {
                 cache
-                    .get_or_update(key1, fut2(Duration::from_secs(1), 1337))
+                    .get_or_update(key1, || fut2(Duration::from_secs(1), 1337))
                     .await
             })
         };
@@ -408,7 +461,7 @@ mod test {
             let cache = cache.clone();
             tokio::spawn(async move {
                 cache
-                    .get_or_update(key2, fut2(Duration::from_secs(0), 1337))
+                    .get_or_update(key2, || fut2(Duration::from_secs(0), 1337))
                     .await
             })
         };
@@ -416,7 +469,7 @@ mod test {
             let cache = cache.clone();
             tokio::spawn(async move {
                 cache
-                    .get_or_update(key3, fut2(Duration::from_secs(0), 1337))
+                    .get_or_update(key3, || fut2(Duration::from_secs(0), 1337))
                     .await
             })
         };
@@ -425,7 +478,7 @@ mod test {
             let cache = cache.clone();
             tokio::spawn(async move {
                 cache
-                    .get_or_update(key1, fut2(Duration::from_secs(0), 1337))
+                    .get_or_update(key1, || fut2(Duration::from_secs(0), 1337))
                     .await
             })
         };
@@ -440,8 +493,6 @@ mod test {
         // waiting for the first update to finish
         println!("Val1 = {:?}", value1_second_get.await.unwrap().unwrap());
 
-        println!("len: {}", cache.cache.cache.lock().memory_usage());
-
         let lock = cache.cache.cache.lock();
         for elt in lock.iter() {
             println!("{}: {:?}", elt.0, elt.1);
@@ -454,31 +505,31 @@ mod test {
         Ok(retval)
     }
 
-    #[tokio::test]
-    async fn test_uner_load() {
-        let cache: Arc<Cache<i32, u32, Infallible>> =
-            Arc::new(Cache::new(Duration::from_secs(1), 2));
+    #[tokio::test(flavor = "multi_thread", worker_threads = 16)]
+    async fn test_under_load() {
+        let cache: Arc<DedCache<i32, u32, Infallible>> =
+            Arc::new(DedCache::new(Duration::from_secs(1), 2));
 
-        let start = std::time::Instant::now();
+        let start = Instant::now();
         // spawning 100 task groups which will try to get the same key within group
 
         let mut futures_list = Vec::new();
         for key in 0..100 {
-            {
-                let cache = cache.clone();
-                tokio::spawn(async move {
-                    cache
-                        .get_or_update(key, fut2(Duration::from_secs(5), key as u32))
-                        .await
-                });
-            }
+            // {
+            //     let cache = cache.clone();
+            //     tokio::spawn(async move {
+            //         cache
+            //             .get_or_update(key, || fut2(Duration::from_secs(5), key as u32))
+            //             .await
+            //     });
+            // }
 
             let mut futures = Vec::new();
             for _ in 0..100 {
                 let cache = cache.clone();
                 let handle = tokio::spawn(async move {
                     cache
-                        .get_or_update(key, fut2(Duration::from_secs(0), key as u32))
+                        .get_or_update(key, || fut2(Duration::from_secs(1), key as u32))
                         .await
                 });
                 futures.push(handle);
@@ -495,5 +546,7 @@ mod test {
 
         assert!(start.elapsed() < Duration::from_secs(6));
         println!("Stats: {:?}", cache.fetch_stats());
+        assert!(cache.fetch_stats().cache_hit_ratio > 0.9);
+        assert_eq!(cache.fetch_stats().calls_made, 100);
     }
 }
