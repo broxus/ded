@@ -94,7 +94,7 @@ where
 struct SharedState<Req, Res, Err> {
     cache: RequestLru<Req, Res, Err>,
     lifetime: Duration,
-    requests_made: AtomicU64,
+    total_requests: AtomicU64,
     calls_made: AtomicU64,
     cache_hit: AtomicU64,
 }
@@ -109,7 +109,7 @@ where
         Self {
             cache: Mutex::new(LruMap::new(ByLength::new(size))),
             lifetime,
-            requests_made: Default::default(),
+            total_requests: Default::default(),
             cache_hit: Default::default(),
             calls_made: Default::default(),
         }
@@ -238,18 +238,18 @@ where
             (cache.memory_usage(), cache.len())
         };
 
-        let requests_made = self.requests_made.load(Ordering::Relaxed);
+        let total_requests = self.total_requests.load(Ordering::Relaxed);
         let calls_made = self.calls_made.load(Ordering::Relaxed);
         let cache_hit = self.cache_hit.load(Ordering::Relaxed);
 
-        let cache_hit_ratio = if requests_made == 0 {
+        let cache_hit_ratio = if total_requests == 0 {
             0.0
         } else {
-            cache_hit as f64 / requests_made as f64
+            cache_hit as f64 / total_requests as f64
         };
 
         Stats {
-            requests_made,
+            total_requests,
             cache_hit,
             memory_usage,
             len,
@@ -259,7 +259,7 @@ where
     }
 
     fn update_request_number(&self) {
-        self.requests_made.fetch_add(1, Ordering::Relaxed);
+        self.total_requests.fetch_add(1, Ordering::Relaxed);
     }
 
     fn update_calls_number(&self) {
@@ -296,9 +296,13 @@ pub struct Stats {
     pub memory_usage: usize,
     pub len: usize,
 
-    pub requests_made: u64,
+    /// number of requests for `get_or_update`
+    pub total_requests: u64,
+    /// number of requests which were called upstream
     pub calls_made: u64,
+    /// number of requests which were served from the cache
     pub cache_hit: u64,
+    /// ratio of cache hits to total requests in range [0.0, 100.0]
     pub cache_hit_ratio: f64,
 }
 
@@ -319,7 +323,7 @@ mod test {
 
     #[tokio::test]
     async fn test_cache() {
-        let cache: DedCache<_, _, Infallible> = DedCache::new(Duration::from_secs(1), 1024);
+        let cache = DedCache::<_, _, Infallible>::new(Duration::from_secs(1), 1024);
 
         let key = "key";
 
@@ -327,7 +331,7 @@ mod test {
         let value = cache.get_or_update(key, fut).await.unwrap();
         assert_eq!(value, "value"); // value is returned
 
-        let start = std::time::Instant::now();
+        let start = Instant::now();
 
         let value = cache.get_or_update(key, fut).await.unwrap();
         // value is returned immediately
@@ -361,8 +365,7 @@ mod test {
 
     #[tokio::test]
     async fn test_with_eviction() {
-        let cache: Arc<DedCache<i32, u32, Infallible>> =
-            Arc::new(DedCache::new(Duration::from_secs(1), 2));
+        let cache = DedCache::<_, _, Infallible>::new(Duration::from_secs(1), 2);
 
         // creating 3 updates so that the first one is evicted
         let key1 = 1;
@@ -428,23 +431,13 @@ mod test {
 
     #[tokio::test]
     async fn test_under_load() {
-        let cache: Arc<DedCache<i32, u32, Infallible>> =
-            Arc::new(DedCache::new(Duration::from_secs(1), 2));
+        let cache = DedCache::<_, _, Infallible>::new(Duration::from_secs(1), 100);
 
         let start = Instant::now();
         // spawning 100 task groups which will try to get the same key within group
 
         let mut futures_list = Vec::new();
         for key in 0..100 {
-            // {
-            //     let cache = cache.clone();
-            //     tokio::spawn(async move {
-            //         cache
-            //             .get_or_update(key, || fut2(Duration::from_secs(5), key as u32))
-            //             .await
-            //     });
-            // }
-
             let mut futures = Vec::new();
             for _ in 0..100 {
                 let cache = cache.clone();
